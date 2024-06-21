@@ -100,7 +100,7 @@ func main() {
 		go func(sub *Subscriber, wg *sync.WaitGroup) {
 			defer wg.Done()
 			sub.Subscribe(ready)
-			fmt.Println("Subscriber started")
+			fmt.Println("1111")
 		}(subscriber, &wg)
 	}
 
