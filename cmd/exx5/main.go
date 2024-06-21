@@ -13,9 +13,9 @@ var ctx = context.Background()
 
 var events = map[string]string{
 	"ships_channel": "I am in the ocean",
-	//"dogs_channel":  "Woof Woof",
-	//"cats_channel":  "Meow Meow",
-	//"rats_channel":  "mi mi",
+	"dogs_channel":  "Woof Woof",
+	"cats_channel":  "Meow Meow",
+	"rats_channel":  "mi mi",
 }
 
 // Global Publisher
@@ -48,18 +48,19 @@ func NewSubscriber(client *redis.Client, chans ...string) *Subscriber {
 	return &Subscriber{client: client, channels: chans}
 }
 
-func (s *Subscriber) Subscribe(index int) {
+func (s *Subscriber) Subscribe(ready chan bool) {
 	pubsub := s.client.Subscribe(ctx, s.channels...)
 	defer pubsub.Close()
 
+	ready <- true
+
 	msg, err := pubsub.ReceiveMessage(ctx)
-	fmt.Println(index)
 	if err != nil {
 		log.Printf("Error receiving message: %v", err)
 		return
 	}
 
-	fmt.Println("Subcriber recieve: ", msg.Channel, msg.Payload)
+	fmt.Println("Subscriber received:", msg.Channel, msg.Payload)
 }
 
 func initRedis() (*redis.Client, error) {
@@ -80,7 +81,7 @@ func initRedis() (*redis.Client, error) {
 func main() {
 	rdb, err := initRedis()
 	if err != nil {
-		log.Fatal("Redis connection error: ", err)
+		log.Fatal("Redis connection error:", err)
 	}
 
 	var wg sync.WaitGroup
@@ -88,23 +89,28 @@ func main() {
 	publisher := NewPublisher(rdb)
 	subscribers := []*Subscriber{
 		NewSubscriber(rdb, "ships_channel"),
-		//NewSubscriber(rdb, "dogs_channel"),
-		//NewSubscriber(rdb, "cats_channel"),
-		//NewSubscriber(rdb, "ships_channel", "dogs_channel", "cats_channel"),
+		NewSubscriber(rdb, "dogs_channel"),
+		NewSubscriber(rdb, "cats_channel"),
+		NewSubscriber(rdb, "ships_channel", "dogs_channel", "cats_channel"),
+	}
+
+	ready := make(chan bool, len(subscribers))
+	for _, subscriber := range subscribers {
+		wg.Add(1)
+		go func(sub *Subscriber, wg *sync.WaitGroup) {
+			defer wg.Done()
+			sub.Subscribe(ready)
+			fmt.Println("Subscriber started")
+		}(subscriber, &wg)
+	}
+
+	for range subscribers {
+		<-ready
 	}
 
 	go func() {
 		publisher.Publish(events)
 	}()
-
-	for i, subscriber := range subscribers {
-		wg.Add(1)
-		go func(sub *Subscriber, wg *sync.WaitGroup, i int) {
-			defer wg.Done()
-			sub.Subscribe(i)
-			fmt.Println("1111")
-		}(subscriber, &wg, i)
-	}
 
 	wg.Wait()
 }
