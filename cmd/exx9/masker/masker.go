@@ -2,8 +2,8 @@ package masker
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -29,35 +29,6 @@ func selectMaskingStrategy(strategy []maskingStrategy) maskingStrategy {
 	return defaultMaskingStrategy
 }
 
-// extractKeysFromJSONString extracts all keys from JSON in proper order
-func extractKeysFromJSONString(jsonStr string) ([]string, error) {
-	// Remove spaces for easier processing
-	jsonStr = strings.ReplaceAll(jsonStr, " ", "")
-
-	var keys []string
-	length := len(jsonStr)
-
-	for i := 0; i < length; i++ {
-		// Look for key between " " and :
-		if jsonStr[i] == '"' {
-			start := i + 1
-			end := strings.Index(jsonStr[start:], "\"")
-			if end == -1 {
-				return nil, errors.New("error: closing quote not found")
-			}
-			end += start
-
-			// Check if there's a colon after the key
-			if end+1 < length && jsonStr[end+1] == ':' {
-				key := jsonStr[start:end]
-				keys = append(keys, key)
-				i = end + 1 // Skip the key and colon
-			}
-		}
-	}
-	return keys, nil
-}
-
 // MaskByKeys masks values for specified keys
 // Params:
 // - jsonData: JSON string
@@ -74,44 +45,7 @@ func MaskByKeys(jsonData string, keys []string, strategy ...maskingStrategy) (st
 	// Call the masking function
 	maskedJSON, err := maskJSON([]byte(jsonData), config)
 	if err != nil {
-		return "", fmt.Errorf("error during masking by keys: %w", err)
-	}
-	return string(maskedJSON), nil
-}
-
-// MaskByIndexes masks values by the indexes of the keys
-// Params:
-// - jsonData: JSON string
-// - indexes: indexes of the keys whose values should be masked
-// - strategy: custom masking strategy (optional)
-// Returns the masked JSON and an error (if any)
-func MaskByIndexes(jsonData string, indexes []int, strategy ...maskingStrategy) (string, error) {
-	maskStrategy := selectMaskingStrategy(strategy)
-	keys, err := extractKeysFromJSONString(jsonData)
-	if err != nil {
-		return "", fmt.Errorf("error extracting keys: %w", err)
-	}
-
-	if len(keys) == 0 {
-		return "", errors.New("no keys found")
-	}
-
-	var newKeys []string
-	for _, index := range indexes {
-		if index < 0 || index >= len(keys) {
-			return "", fmt.Errorf("index %d is out of bounds for keys", index)
-		}
-		newKeys = append(newKeys, keys[index])
-	}
-
-	config := maskConfig{
-		Keys:         newKeys,
-		MaskStrategy: maskStrategy,
-	}
-
-	maskedJSON, err := maskJSON([]byte(jsonData), config)
-	if err != nil {
-		return "", fmt.Errorf("error during masking by indexes: %w", err)
+		return "", err
 	}
 	return string(maskedJSON), nil
 }
@@ -126,9 +60,9 @@ func maskJSON(input []byte, config maskConfig) ([]byte, error) {
 	}
 
 	// Mask the data
-	maskedData, err := processMap(data, config, false)
+	maskedData, err := processMap(data, config, false, "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error processing map: %w", err)
 	}
 
 	// Encode back into JSON
@@ -141,87 +75,162 @@ func maskJSON(input []byte, config maskConfig) ([]byte, error) {
 }
 
 // processMap processes the JSON object and masks values where necessary
-func processMap(data map[string]interface{}, config maskConfig, maskAll bool) (interface{}, error) {
+func processMap(data map[string]interface{}, config maskConfig, maskAll bool, path string) (interface{}, error) {
 	maskedData := make(map[string]interface{})
+	var err error
 	for key, value := range data {
-		if contains(config.Keys, key) || maskAll {
+		fullPath := appendPath(path, key)
+		if contains(config.Keys, key, fullPath) || maskAll {
 			// Mask the value
-			maskedData[key] = processValueForMasking(value, config)
+			maskedData[key], err = processValue(value, config, true, fullPath)
 		} else {
 			// Recursively process nested structures
-			maskedData[key] = processValue(value, config)
+			maskedData[key], err = processValue(value, config, false, fullPath)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 	return maskedData, nil
 }
 
 // processSlice processes an array of JSON data
-func processSlice(data []interface{}, config maskConfig, maskAll bool) ([]interface{}, error) {
+func processSlice(data []interface{}, config maskConfig, maskAll bool, indexStart int, indexEnd int, path string) ([]interface{}, error) {
+	if indexStart < 0 || indexEnd > len(data) || indexStart > indexEnd {
+		return nil, fmt.Errorf("invalid range")
+	}
 	maskedSlice := make([]interface{}, len(data))
+	var err error
 	for i, value := range data {
-		if maskAll {
-			maskedSlice[i] = processValueForMasking(value, config)
-			continue
+		if maskAll || indexStart <= i && i < indexEnd {
+			maskedSlice[i], err = processValue(value, config, true, path)
+
+		} else {
+			maskedSlice[i], err = processValue(value, config, false, path)
 		}
-		maskedSlice[i] = processValue(value, config)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return maskedSlice, nil
 }
 
 // processValue processes the value based on its type
-func processValue(value interface{}, config maskConfig) interface{} {
+func processValue(value interface{}, config maskConfig, toHash bool, path string) (interface{}, error) {
 	switch v := value.(type) {
 	case map[string]interface{}:
-		maskedValue, _ := processMap(v, config, false)
-		return maskedValue
+		maskedValue, err := processMap(v, config, toHash, path)
+		if err != nil {
+			return nil, err
+		}
+		return maskedValue, nil
 	case []interface{}:
-		maskedValue, _ := processSlice(v, config, false)
-		return maskedValue
-	case float64:
-		return v
-	case int:
-		return v
+		name, err := isSliceTag(config.Keys, path)
+		if err != nil {
+			return nil, err
+		}
+
+		var indexStart, indexEnd int
+		if name != "" {
+			indexStart, indexEnd, err = parseRange(name, len(v))
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		maskedValue, err := processSlice(v, config, toHash, indexStart, indexEnd, path)
+		if err != nil {
+			return nil, err
+		}
+
+		return maskedValue, nil
+	case float64, int, bool, nil:
+		if toHash {
+			return config.MaskStrategy(v), nil
+		}
+		return v, nil
 	case string:
-		return v
-	case bool:
-		return v
-	case nil:
-		return v
+		if toHash {
+			return config.MaskStrategy(v), nil
+		}
+		return v, nil
 	default:
-		return "nil"
+		return "nil", nil
 	}
 }
 
-// processValueForMasking processes the value and applies the masking strategy
-func processValueForMasking(value interface{}, config maskConfig) interface{} {
-	switch v := value.(type) {
-	case map[string]interface{}:
-		maskedValue, _ := processMap(v, config, true)
-		return maskedValue
-	case []interface{}:
-		maskedValue, _ := processSlice(v, config, true)
-		return maskedValue
-	case float64:
-		return config.MaskStrategy(v)
-	case int:
-		return config.MaskStrategy(v)
-	case string:
-		return config.MaskStrategy(v)
-	case bool:
-		return config.MaskStrategy(v)
-	case nil:
-		return config.MaskStrategy(v)
-	default:
-		return "nil"
+// appendPath appends a key to the current path, forming the full path
+func appendPath(base, key string) string {
+	if base == "" {
+		return key
 	}
+	return base + "/" + key
 }
 
-// contains checks if an item exists in a list
-func contains(slice []string, item string) bool {
+// contains checks if a key or path exists in the list of keys
+func contains(slice []string, key string, path string) bool {
 	for _, v := range slice {
-		if v == item {
+		if v == key || v == path {
 			return true
 		}
 	}
 	return false
+}
+
+// isSliceTag checks if the path corresponds to a slice tag (e.g., "friends[0:5]")
+func isSliceTag(slice []string, path string) (string, error) {
+	for _, key := range slice {
+		openBracket := strings.Index(key, "[")
+		closeBracket := strings.Index(key, "]")
+		if openBracket == -1 && closeBracket == -1 {
+			continue
+		}
+		name := key[:openBracket]
+		if openBracket == -1 || closeBracket == -1 || openBracket > closeBracket {
+			return "", fmt.Errorf("invalid slice format in key: %s", key)
+		}
+
+		if strings.Contains(path, name) {
+			return key, nil
+		}
+	}
+	return "", nil
+}
+
+// parseRange parses a slice range (e.g., "friends[0:5]" or "[2:]")
+func parseRange(s string, length int) (int, int, error) {
+	var startIndex, endIndex int
+	var err error
+	openBracket := strings.Index(s, "[")
+	closeBracket := strings.Index(s, "]")
+
+	rangePart := s[openBracket+1 : closeBracket]
+	colonIndex := strings.Index(rangePart, ":")
+	if colonIndex == -1 {
+		startIndex, err = strconv.Atoi(rangePart)
+		if err != nil {
+			return 0, 0, err
+		}
+		return startIndex, startIndex + 1, nil
+	}
+
+	if startStr := rangePart[:colonIndex]; startStr == "" {
+		startIndex = 0
+	} else {
+		startIndex, err = strconv.Atoi(startStr)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	if endStr := rangePart[colonIndex+1:]; endStr == "" {
+		endIndex = length
+	} else {
+		endIndex, err = strconv.Atoi(endStr)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	return startIndex, endIndex, nil
 }
